@@ -45,6 +45,11 @@ on:
         description: "Scheme override (leave empty to auto-detect)"
         type: string
         default: ""
+      runner:
+        description: "macOS runner image (switch pools if one is saturated)"
+        type: choice
+        default: macos-15
+        options: [macos-15, macos-26]
 
 concurrency:
   group: ios-build
@@ -55,7 +60,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 45
     env:
       HAS_P12: ${{ secrets.P12_BASE64 != '' }}
