@@ -53,14 +53,23 @@ workflows:
           set -o pipefail
           source ~/.codemagic-env
           mkdir -p build
-          xcodebuild archive \
+          if xcodebuild archive \
             -project "$PROJ" \
             -scheme "$SCHEME" \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath build/App.xcarchive \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
-            2>&1 | tee build/build.log
+            2>&1 | tee build/build.log; then
+            echo "ARCHIVE SUCCEEDED"
+          else
+            echo ""
+            echo "============ ARCHIVE FAILED - real error lines ============"
+            grep -nE "error:|BUILD FAILED|ARCHIVE FAILED|The following build commands failed|development team|no signing|Signing for" build/build.log | head -25 || true
+            echo "============ last 25 lines of the build log ============"
+            tail -25 build/build.log || true
+            exit 1
+          fi
 
       - name: Package IPA (clearly labelled UNSIGNED)
         script: |
