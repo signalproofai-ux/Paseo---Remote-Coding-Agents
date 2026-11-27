@@ -1,6 +1,8 @@
 .env
 *.token
 .gh-token
+secure/
+.state/
 upload/
 node_modules/
 __pycache__/
@@ -8,3 +10,4 @@ __pycache__/
 .venv/
 .next/
 download/*.zip
+download/daemon-password.txt
