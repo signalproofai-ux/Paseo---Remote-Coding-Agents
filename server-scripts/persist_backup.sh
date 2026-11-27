@@ -39,6 +39,7 @@ cp -f "$WS/download/ios-build-infra/.github/workflows/ios-build.yml" "$REPO_DIR/
 cp -f "$WS/download/ios-build-infra/DemoApp/project.yml" "$REPO_DIR/project.yml" 2>/dev/null || true
 cp -f "$WS/download/ios-build-infra/DemoApp/Sources/"*.swift "$REPO_DIR/Sources/" 2>/dev/null || true
 cp -f "$WS/download/ios-build-infra/build-ledger.json" "$REPO_DIR/build-ledger.json" 2>/dev/null || true
+cp -f "$WS/download/ios-build-infra/codemagic.yaml" "$REPO_DIR/codemagic.yaml" 2>/dev/null || true
 
 # 3) make sure secrets never enter the repo
 cat > "$REPO_DIR/.gitignore" <<'EOF'
