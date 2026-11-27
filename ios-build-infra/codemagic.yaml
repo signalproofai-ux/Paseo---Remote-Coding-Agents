@@ -1,0 +1,86 @@
+# =============================================================================
+# codemagic.yaml - Codemagic individual Free plan (500 free macOS M2 minutes
+# per month, reset on the 1st of each month; docs.codemagic.io/pricing).
+#
+# Schema keys verified against docs.codemagic.io/yaml-basic-configuration/
+# yaml-getting-started: workflows / name / instance_type / max_build_duration /
+# environment.xcode / scripts / artifacts / publishing.
+#
+# Manual-only: no "triggering: events" block is defined, so builds can be
+# started ONLY via "Start new build" in the Codemagic dashboard (iPhone Safari).
+#
+# Zero-cost rules: instance_type mac_mini_m2 is the only macOS machine on the
+# free tier (mac_mini_m4 requires billing enabled - not used). No billing,
+# no card, no paid minutes.
+# =============================================================================
+workflows:
+  ios-build:
+    name: iOS build
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      xcode: latest
+    scripts:
+      - name: Build environment evidence
+        script: |
+          set -e
+          xcodebuild -version
+          sw_vers -productVersion
+          echo "Runner: Mac mini M2 (macOS $(sw_vers -productVersion))"
+
+      - name: Detect project (xcodeproj / workspace / XcodeGen)
+        script: |
+          set -e
+          PROJ=$(ls -d *.xcodeproj */*.xcodeproj 2>/dev/null | head -1)
+          if [ -z "$PROJ" ] && [ -f project.yml ]; then
+            echo "Generating project with XcodeGen..."
+            brew install --quiet xcodegen
+            xcodegen generate
+            PROJ=$(ls -d *.xcodeproj | head -1)
+          fi
+          if [ -z "$PROJ" ]; then
+            echo "ERROR: no .xcodeproj, .xcworkspace or project.yml found in repository root."
+            exit 1
+          fi
+          echo "export PROJ=$PROJ" >> ~/.codemagic-env
+          SCHEME=$(xcodebuild -list -json -project "$PROJ" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['project']['schemes'][0])")
+          echo "export SCHEME=$SCHEME" >> ~/.codemagic-env
+          echo "Project: $PROJ  Scheme: $SCHEME"
+
+      - name: Archive (unsigned - no signing credentials on free tier)
+        script: |
+          set -e
+          set -o pipefail
+          source ~/.codemagic-env
+          mkdir -p build
+          xcodebuild archive \
+            -project "$PROJ" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/App.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
+            2>&1 | tee build/build.log
+
+      - name: Package IPA (clearly labelled UNSIGNED)
+        script: |
+          set -e
+          APP=$(find build/App.xcarchive/Products/Applications -maxdepth 1 -name "*.app" | head -1)
+          if [ -z "$APP" ]; then echo "ERROR: archive produced no .app"; exit 1; fi
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/
+          (cd build && zip -qry App_UNSIGNED.ipa Payload)
+          echo "IMPORTANT: App_UNSIGNED.ipa is NOT installable on a device as-is."
+          echo "Re-sign it with AltStore/Sideloadly, or configure Apple signing"
+          echo "in Codemagic to produce an installable IPA."
+          unzip -l build/App_UNSIGNED.ipa | head -8
+
+    artifacts:
+      - build/*.ipa
+      - build/build.log
+
+    publishing:
+      email:
+        recipients: []
+        notify_success: true
+        notify_failure: true

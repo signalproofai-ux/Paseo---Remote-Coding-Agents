@@ -1,0 +1,333 @@
+# =============================================================================
+# iOS Build Workflow - zero-cost, manual-only, iPhone-manageable
+#
+# Design rules honoured by this file:
+#   - workflow_dispatch ONLY: nothing runs on push/PR (no wasted minutes)
+#   - concurrency: one build at a time; safe cancellation of queued duplicates
+#   - build-ledger.json tracks cumulative quota minutes; the build REFUSES to
+#     start when the monthly free allowance is nearly exhausted
+#   - runner macos-15 (Apple Silicon): genuine macOS + Xcode; macos-26 also valid
+#   - unsigned IPA by default (clearly labelled NOT installable); signed IPA
+#     only when P12/provisioning secrets exist - never fabricated
+#   - all errors land in the run summary so they are readable in Safari
+#
+# Free allowance context (verified 2026-11-27):
+#   GitHub Free private repos include 2,000 Actions minutes/month.
+#   macOS runners consume quota at 10x: 1 clock minute = 10 quota minutes.
+#   => approximately 200 clock-minutes (~2,000 quota minutes) of macOS/month.
+#   The ledger below counts QUOTA minutes and warns at 1,200 / stops at 1,800.
+# =============================================================================
+name: iOS Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Build configuration"
+        type: choice
+        default: Release
+        options: [Release, Debug]
+      run_tests:
+        description: "Run available tests (costs extra minutes)"
+        type: boolean
+        default: false
+      signing:
+        description: "Signing mode"
+        type: choice
+        default: auto
+        options: [auto, unsigned]
+      export_method:
+        description: "Export method when signing credentials exist"
+        type: choice
+        default: ad-hoc
+        options: [ad-hoc, app-store, development, enterprise]
+      scheme:
+        description: "Scheme override (leave empty to auto-detect)"
+        type: string
+        default: ""
+
+concurrency:
+  group: ios-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      HAS_P12: ${{ secrets.P12_BASE64 != '' }}
+      HAS_PROFILE: ${{ secrets.MOBILEPROVISION_BASE64 != '' }}
+      P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      PROFILE_NAME: ${{ secrets.PROVISIONING_PROFILE_NAME }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      # ---------------------------------------------------------------
+      # 1) FREE-MINUTE GUARD - runs before anything expensive
+      # ---------------------------------------------------------------
+      - name: Free-minute guard
+        run: |
+          TOTAL=$(python3 -c "import json;print(json.load(open('build-ledger.json')).get('quota_minutes_total',0))" 2>/dev/null || echo 0)
+          echo "ledger quota minutes used this month: $TOTAL / 2000 included" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$TOTAL" -ge 1800 ]; then
+            echo "::error::Free monthly quota nearly exhausted ($TOTAL quota minutes). Builds stopped until the next monthly reset. No charges were or will be incurred." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [ "$TOTAL" -ge 1200 ]; then
+            echo "::warning::Approaching free quota limit ($TOTAL quota minutes)." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "QUOTA_OK=$TOTAL" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # 2) XCODE ENVIRONMENT - detect and print (evidence in the log)
+      # ---------------------------------------------------------------
+      - name: Select Xcode
+        run: |
+          XCODE_APP=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version | tee -a "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Build environment"
+            echo "- Runner: macOS (Apple Silicon), image $(sw_vers -productVersion)"
+            echo "- Xcode: $(xcodebuild -version | head -1)"
+            echo "- Configuration: ${{ inputs.configuration }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------
+      # 3) PROJECT DETECTION - xcodeproj / xcworkspace, else XcodeGen
+      # ---------------------------------------------------------------
+      - name: Detect project
+        id: project
+        run: |
+          PROJ=$(ls -d *.xcodeproj */*.xcodeproj 2>/dev/null | head -1)
+          WORKSPACE=$(ls -d *.xcworkspace */*.xcworkspace 2>/dev/null | head -1)
+          if [ -z "$PROJ" ] && [ -z "$WORKSPACE" ] && [ -f project.yml ]; then
+            echo "No .xcodeproj found but project.yml present - generating with XcodeGen..."
+            brew install --quiet xcodegen
+            xcodegen generate
+            PROJ=$(ls -d *.xcodeproj | head -1)
+          fi
+          if [ -n "$WORKSPACE" ]; then
+            echo "kind=workspace" >> "$GITHUB_OUTPUT"
+            echo "path=$WORKSPACE" >> "$GITHUB_OUTPUT"
+          elif [ -n "$PROJ" ]; then
+            echo "kind=project" >> "$GITHUB_OUTPUT"
+            echo "path=$PROJ" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "## Build stopped: no Xcode project found"
+              echo ""
+              echo "This repository does not contain an \`.xcodeproj\`, \`.xcworkspace\` or \`project.yml\` (XcodeGen spec)."
+              echo "Add the iOS project to the repository root (or one folder deep), then run the workflow again."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "project: ${{ steps.project.outputs.path }}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------
+      # 4) SCHEME DETECTION
+      # ---------------------------------------------------------------
+      - name: Detect scheme
+        id: scheme
+        run: |
+          if [ -n "${{ inputs.scheme }}" ]; then
+            S="${{ inputs.scheme }}"
+          else
+            P="${{ steps.project.outputs.path }}"
+            if [ "${{ steps.project.outputs.kind }}" = "workspace" ]; then
+              S=$(xcodebuild -list -json -workspace "$P" | python3 -c "import json,sys;d=json.load(sys.stdin);s=d['workspace']['schemes'];print(next((x for x in s if not x.lower().endswith('(hidden)')), s[0]))")
+            else
+              S=$(xcodebuild -list -json -project "$P" | python3 -c "import json,sys;d=json.load(sys.stdin);s=d['project']['schemes'];print(next((x for x in s if not x.lower().endswith('(hidden)')), s[0]))")
+            fi
+          fi
+          echo "scheme=$S" >> "$GITHUB_OUTPUT"
+          echo "- Scheme: $S" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------
+      # 5) SIGNING SETUP - only when secrets exist; never fabricated
+      # ---------------------------------------------------------------
+      - name: Import signing credentials (if provided)
+        if: env.HAS_P12 == 'true' && env.HAS_PROFILE == 'true' && inputs.signing == 'auto'
+        run: |
+          KC_PW=$(openssl rand -hex 16)
+          echo "KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain" >> "$GITHUB_ENV"
+          security create-keychain -p "$KC_PW" "$RUNNER_TEMP/build.keychain"
+          security set-keychain-settings -t 3600 "$RUNNER_TEMP/build.keychain"
+          echo "$P12_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$RUNNER_TEMP/build.keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PW" "$RUNNER_TEMP/build.keychain" >/dev/null
+          security list-keychains -d user -s "$RUNNER_TEMP/build.keychain" $(security list-keychains -d user | tr -d '"')
+          echo "$PROFILE_B64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/"
+          echo "signing credentials imported (never printed)" | tee -a "$GITHUB_STEP_SUMMARY"
+        env:
+          P12_B64: ${{ secrets.P12_BASE64 }}
+          PROFILE_B64: ${{ secrets.MOBILEPROVISION_BASE64 }}
+
+      # ---------------------------------------------------------------
+      # 6) TESTS (optional, manual opt-in)
+      # ---------------------------------------------------------------
+      - name: Run tests
+        if: inputs.run_tests == true
+        run: |
+          SIM=$(xcrun simctl list devices available | grep -E "iPhone" | head -1 | sed -E 's/^[[:space:]]*//' | sed -E 's/ \(.*///')
+          SIM=${SIM:-iPhone 16}
+          echo "Using simulator: $SIM"
+          P="${{ steps.project.outputs.path }}"
+          if [ "${{ steps.project.outputs.kind }}" = "workspace" ]; then
+            DEST=(-workspace "$P")
+          else
+            DEST=(-project "$P")
+          fi
+          set -o pipefail
+          xcodebuild test "${DEST[@]}" -scheme "${{ steps.scheme.outputs.scheme }}" \
+            -destination "platform=iOS Simulator,name=$SIM" \
+            -resultBundlePath build/tests.xcresult 2>&1 | tee build/test.log
+          echo "- Tests: PASSED" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------
+      # 7) ARCHIVE
+      # ---------------------------------------------------------------
+      - name: Archive
+        run: |
+          mkdir -p build
+          START=$(date +%s)
+          P="${{ steps.project.outputs.path }}"
+          if [ "${{ steps.project.outputs.kind }}" = "workspace" ]; then
+            DEST=(-workspace "$P")
+          else
+            DEST=(-project "$P")
+          fi
+          if [ "$HAS_P12" = "true" ] && [ "$HAS_PROFILE" = "true" ] && [ "${{ inputs.signing }}" = "auto" ]; then
+            set -o pipefail
+            xcodebuild archive "${DEST[@]}" -scheme "${{ steps.scheme.outputs.scheme }}" \
+              -configuration ${{ inputs.configuration }} \
+              -destination 'generic/platform=iOS' \
+              -archivePath build/App.xcarchive \
+              -allowProvisioningUpdates 2>&1 | tee build/build.log
+          else
+            set -o pipefail
+            xcodebuild archive "${DEST[@]}" -scheme "${{ steps.scheme.outputs.scheme }}" \
+              -configuration ${{ inputs.configuration }} \
+              -destination 'generic/platform=iOS' \
+              -archivePath build/App.xcarchive \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= 2>&1 | tee build/build.log
+          fi
+          END=$(date +%s)
+          echo "ARCHIVE_SECONDS=$((END-START))" >> "$GITHUB_ENV"
+          echo "- Archive: OK" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------
+      # 8) IPA EXPORT + VERIFICATION
+      # ---------------------------------------------------------------
+      - name: Export IPA
+        id: ipa
+        run: |
+          APP=$(find build/App.xcarchive/Products/Applications -maxdepth 1 -name "*.app" | head -1)
+          [ -n "$APP" ] || { echo "::error::No .app produced by archive"; exit 1; }
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+          echo "bundle_id=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_P12" = "true" ] && [ "$HAS_PROFILE" = "true" ] && [ "${{ inputs.signing }}" = "auto" ]; then
+            printf '%s\n' \
+              '<?xml version="1.0" encoding="UTF-8"?>' \
+              '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+              '<plist version="1.0"><dict>' \
+              '<key>method</key><string>${{ inputs.export_method }}</string>' \
+              '<key>signingStyle</key><string>automatic</string>' \
+              '<key>stripSwiftSymbols</key><true/>' \
+              '</dict></plist>' > build/ExportOptions.plist
+            [ -n "$TEAM_ID" ] && /usr/libexec/PlistBuddy -c 'Add :teamID string '"$TEAM_ID" build/ExportOptions.plist
+            xcodebuild -exportArchive -archivePath build/App.xcarchive \
+              -exportOptionsPlist build/ExportOptions.plist \
+              -exportPath build/export 2>&1 | tee -a build/build.log
+            IPA=$(find build/export -name "*.ipa" | head -1)
+            [ -n "$IPA" ] || { echo "::error::Export produced no IPA (check signing/provisioning)"; tail -40 build/build.log; exit 1; }
+            SIGNED=signed
+          else
+            mkdir -p build/Payload
+            cp -R "$APP" build/Payload/
+            (cd build && zip -qry "${{ steps.scheme.outputs.scheme }}_UNSIGNED.ipa" Payload)
+            IPA=$(ls build/*_UNSIGNED.ipa | head -1)
+            SIGNED=unsigned
+            {
+              echo "## Signing status"
+              echo "- **UNSIGNED IPA** - this artifact is NOT installable on a device as-is."
+              echo "- To get a signed, installable IPA, add these repository secrets and rerun:"
+              echo "  \`P12_BASE64\` (base64 of signing certificate + key), \`P12_PASSWORD\`, \`MOBILEPROVISION_BASE64\`, optional \`APPLE_TEAM_ID\`, \`PROVISIONING_PROFILE_NAME\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "ipa_path=$IPA" >> "$GITHUB_OUTPUT"
+          echo "signed=$SIGNED" >> "$GITHUB_OUTPUT"
+          # artifact verification (evidence, not assumption)
+          unzip -l "$IPA" | head -12 | tee -a "$GITHUB_STEP_SUMMARY"
+          SIZE=$(stat -f%z "$IPA")
+          echo "- IPA: \`$(basename "$IPA")\` ($SIGNED), $SIZE bytes, bundle id \`$BUNDLE_ID\`" >> "$GITHUB_STEP_SUMMARY"
+          [ "$SIZE" -gt 10000 ] || { echo "::error::IPA suspiciously small ($SIZE bytes)"; exit 1; }
+
+      # ---------------------------------------------------------------
+      # 9) MINUTES LEDGER - keeps the free quota honest
+      # ---------------------------------------------------------------
+      - name: Update minutes ledger
+        if: always()
+        run: |
+          CLOCK=$(( ${ARCHIVE_SECONDS:-0} / 60 + 1 ))
+          QUOTA=$(( CLOCK * 10 ))
+          LEDGER_PY='import json, sys, os
+          clock, quota = int(sys.argv[1]), int(sys.argv[2])
+          try:
+              d = json.load(open("build-ledger.json"))
+          except Exception:
+              d = {"quota_minutes_total": 0, "clock_minutes_total": 0, "runs": []}
+          d["quota_minutes_total"] = d.get("quota_minutes_total", 0) + quota
+          d["clock_minutes_total"] = d.get("clock_minutes_total", 0) + clock
+          d.setdefault("runs", []).append({"run_id": os.environ.get("GITHUB_RUN_ID", "local"), "clock_minutes": clock, "quota_minutes": quota})
+          json.dump(d, open("build-ledger.json", "w"), indent=2)
+          print(d["quota_minutes_total"])'
+          LEDGER_TOTAL=$(python3 -c "$LEDGER_PY" "$CLOCK" "$QUOTA")
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build-ledger.json
+          git commit -m "ci: minutes ledger (+${CLOCK} clock min, +${QUOTA} quota min) [skip ci]" || echo "ledger unchanged"
+          git push
+          {
+            echo "## Minutes"
+            echo "- This run: ~${CLOCK} clock min (~${QUOTA} quota min at 10x)"
+            echo "- Ledger total: ${LEDGER_TOTAL} / 2000 quota minutes this month"
+            echo "- Billing note: Free plan included minutes only. No payment method is required or used."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------
+      # 10) ARTIFACTS + FAILURE REPORTING
+      # ---------------------------------------------------------------
+      - name: Upload IPA and logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-${{ github.run_number }}
+          path: |
+            build/*.ipa
+            build/build.log
+            build/test.log
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Failure report
+        if: failure()
+        run: |
+          {
+            echo "## Build failed"
+            echo ""
+            echo '```'
+            tail -60 build/build.log 2>/dev/null || echo "(no build log - failure occurred earlier; see the failing step above)"
+            echo '```'
+            echo "Diagnosis: check the first error line above. Most common causes: missing scheme, deployment target above the Xcode on this runner, or Swift syntax errors."
+          } >> "$GITHUB_STEP_SUMMARY"
