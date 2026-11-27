@@ -79,8 +79,8 @@ workflows:
       - build/*.ipa
       - build/build.log
 
-    publishing:
-      email:
-        recipients: []
-        notify_success: true
-        notify_failure: true
+    # No publishing.email block: Codemagic's schema requires a non-empty
+    # "recipients" list and only accepts notify settings under the nested
+    # "notify: success/failure" keys - both were flagged as validation
+    # errors on the Free plan. Artifacts are downloaded from the build
+    # page in the dashboard instead.
