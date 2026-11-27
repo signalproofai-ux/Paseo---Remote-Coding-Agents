@@ -47,35 +47,45 @@ workflows:
           echo "export SCHEME=$SCHEME" >> ~/.codemagic-env
           echo "Project: $PROJ  Scheme: $SCHEME"
 
-      - name: Archive (unsigned - no signing credentials on free tier)
+      - name: Build unsigned .app (device SDK - no signing credentials)
         script: |
           set -e
           set -o pipefail
           source ~/.codemagic-env
           mkdir -p build
-          if xcodebuild archive \
+          # The archive action's Validate step fails on Xcode 16 when signing is
+          # fully disabled ("Build input file cannot be found: .../Info.plist").
+          # The plain build action for iphoneos has no Validate step and yields
+          # the same unsigned .app, which we package into an IPA ourselves.
+          if xcodebuild build \
             -project "$PROJ" \
             -scheme "$SCHEME" \
             -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -archivePath build/App.xcarchive \
+            -sdk iphoneos \
+            -derivedDataPath build/DD \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
             2>&1 | tee build/build.log; then
-            echo "ARCHIVE SUCCEEDED"
+            echo "BUILD SUCCEEDED"
           else
             echo ""
-            echo "============ ARCHIVE FAILED - real error lines ============"
-            grep -nE "error:|BUILD FAILED|ARCHIVE FAILED|The following build commands failed|development team|no signing|Signing for" build/build.log | head -25 || true
+            echo "============ BUILD FAILED - real error lines ============"
+            grep -nE "error:|BUILD FAILED|The following build commands failed|Build input file cannot be found|development team|no signing|Signing for" build/build.log | head -25 || true
             echo "============ last 25 lines of the build log ============"
             tail -25 build/build.log || true
             exit 1
           fi
+          APP=$(find build/DD/Build/Products -maxdepth 4 -type d -name "*.app" | head -1)
+          if [ -z "$APP" ]; then echo "ERROR: build produced no .app"; exit 1; fi
+          echo "export APP_PATH=$APP" >> ~/.codemagic-env
+          echo "Unsigned .app ready: $APP"
 
       - name: Package IPA (clearly labelled UNSIGNED)
         script: |
           set -e
-          APP=$(find build/App.xcarchive/Products/Applications -maxdepth 1 -name "*.app" | head -1)
-          if [ -z "$APP" ]; then echo "ERROR: archive produced no .app"; exit 1; fi
+          source ~/.codemagic-env
+          APP="$APP_PATH"
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then echo "ERROR: no .app passed from the build step"; exit 1; fi
+          rm -rf build/Payload
           mkdir -p build/Payload
           cp -R "$APP" build/Payload/
           (cd build && zip -qry App_UNSIGNED.ipa Payload)
