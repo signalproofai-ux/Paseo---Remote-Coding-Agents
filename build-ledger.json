@@ -1,0 +1,6 @@
+{
+  "quota_minutes_total": 0,
+  "clock_minutes_total": 0,
+  "note": "GitHub Actions quota ledger. Free plan includes 2000 quota minutes/month for private repos; macOS consumes 10 quota minutes per clock minute. The workflow stops itself at 1800 quota minutes (safety margin) and warns at 1200.",
+  "runs": []
+}

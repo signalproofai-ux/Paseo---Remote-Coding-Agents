@@ -31,6 +31,15 @@ mkdir -p "$REPO_DIR/server-scripts"
 cp -f "$WS"/scripts/*.sh "$REPO_DIR/server-scripts/" 2>/dev/null || true
 cp -f "$WS"/scripts/*.py "$REPO_DIR/server-scripts/" 2>/dev/null || true
 
+# 2b) iOS build infra at repo ROOT — the Actions workflow only fires from
+#     .github/workflows/ at the repo root, so these must be top-level in
+#     every snapshot or the backup force-push would wipe them again.
+mkdir -p "$REPO_DIR/.github/workflows" "$REPO_DIR/Sources"
+cp -f "$WS/download/ios-build-infra/.github/workflows/ios-build.yml" "$REPO_DIR/.github/workflows/ios-build.yml" 2>/dev/null || true
+cp -f "$WS/download/ios-build-infra/DemoApp/project.yml" "$REPO_DIR/project.yml" 2>/dev/null || true
+cp -f "$WS/download/ios-build-infra/DemoApp/Sources/"*.swift "$REPO_DIR/Sources/" 2>/dev/null || true
+cp -f "$WS/download/ios-build-infra/build-ledger.json" "$REPO_DIR/build-ledger.json" 2>/dev/null || true
+
 # 3) make sure secrets never enter the repo
 cat > "$REPO_DIR/.gitignore" <<'EOF'
 .env
